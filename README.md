@@ -6,7 +6,7 @@ A lightweight, high-performance cloud runner that keeps your Discord account bro
 
 ---
 
-## ✨ Features
+##  Features
 
 - **24/7 Cloud Uptime**: Runs 100% on cloud servers (Render, Koyeb, Railway, VPS, or Termux).
 - **Zero PC Usage**: You can turn off your computer or go offline; the cloud host keeps your presence active.
@@ -16,7 +16,7 @@ A lightweight, high-performance cloud runner that keeps your Discord account bro
 
 ---
 
-## 🚀 1-Click Setup on Render (Free)
+##  1-Click Setup on Render (Free)
 
 ### Step 1: Fork or Use this Repository
 1. Click **Star** and **Fork** this repository to your GitHub account (or upload these files to your own repository).
