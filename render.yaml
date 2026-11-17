@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: discord-streaming-presence
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python cloud_presence.py
+    envVars:
+      - key: DISCORD_TOKEN
+        sync: false
+      - key: STREAM_GAME
+        value: Minecraft
+      - key: STREAM_TITLE
+        value: 24/7 Live Stream
+      - key: STREAM_URL
+        value: https://www.twitch.tv/discord
+      - key: PORT
+        value: 8080
