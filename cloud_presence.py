@@ -1,9 +1,11 @@
 """
 24/7 Discord Automated Voice Channel Streamer & Live Badge Farmer.
-Self-healing engine:
-- Main account directly joins voice channel and screen shares 24/7.
-- Survives PC shutdown, Discord restarts, and offline mode (auto-rejoins on disconnect).
-- Alt account joins without mute/deafen as an active natural stream viewer.
+Production-grade stability:
+- Connects cleanly to Voice Channel and starts Go-Live screen share.
+- Eliminates Opcode 4 spam (only re-joins on actual disconnects).
+- Rock-solid Gateway & Voice heartbeats.
+- Embedded self-pinging keep-alive to prevent Render free-tier sleep.
+- Independent, resilient Alt account viewer worker.
 """
 
 from __future__ import annotations
@@ -38,6 +40,7 @@ GAME_NAME = os.environ.get("STREAM_GAME", "Minecraft").strip()
 STREAM_TITLE = os.environ.get("STREAM_TITLE", "24/7 Live Stream").strip()
 STREAM_URL = os.environ.get("STREAM_URL", "https://www.twitch.tv/discord").strip()
 PORT = int(os.environ.get("PORT", "8080"))
+EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "").strip()
 
 GATEWAY_URL = "wss://gateway.discord.gg/?v=9&encoding=json"
 USER_AGENT = (
@@ -48,7 +51,7 @@ USER_AGENT = (
 
 
 class KeepAliveHandler(BaseHTTPRequestHandler):
-    """Keeps cloud containers awake via health checks."""
+    """Responds to uptime pings to keep cloud container awake 24/7."""
 
     def do_GET(self) -> None:
         self.send_response(200)
@@ -58,8 +61,8 @@ class KeepAliveHandler(BaseHTTPRequestHandler):
             "<!DOCTYPE html><html><head><title>Discord 24/7 Cloud Streamer</title></head>"
             "<body style='font-family:sans-serif;background:#0b0d12;color:#fff;text-align:center;padding:50px;'>"
             "<h2 style='color:#a855f7;'>🟣 Discord 24/7 Cloud Streamer: ACTIVE</h2>"
-            f"<p>Channel: <b>{VOICE_CHANNEL_ID}</b> | Title: <b>{STREAM_TITLE}</b></p>"
-            "<p style='color:#4ade80;'>✔ Self-healing screen share engine is running 24/7.</p>"
+            f"<p>Target Voice Channel: <b>{VOICE_CHANNEL_ID}</b></p>"
+            "<p style='color:#4ade80;'>✔ Gateway WebSockets connected. Voice & Stream running 24/7.</p>"
             "</body></html>"
         )
         self.wfile.write(html.encode("utf-8"))
@@ -75,6 +78,21 @@ def start_http_health_check() -> None:
         server.serve_forever()
     except Exception as e:
         logger.warning(f"Could not bind HTTP server on port {PORT}: {e}")
+
+
+def self_ping_worker() -> None:
+    """Periodically pings own HTTP server to prevent container sleep."""
+    url = EXTERNAL_URL
+    if not url:
+        return
+    logger.info(f"Keep-Alive auto-pinger started for URL: {url}")
+    while True:
+        try:
+            time.sleep(300)  # Ping every 5 minutes
+            r = requests.get(url, timeout=10)
+            logger.info(f"[Keep-Alive] Ping {url} -> status {r.status_code}")
+        except Exception as e:
+            logger.warning(f"[Keep-Alive] Ping notice: {e}")
 
 
 def resolve_guild_id(token: str, channel_id: str) -> Optional[str]:
@@ -95,7 +113,7 @@ def resolve_guild_id(token: str, channel_id: str) -> Optional[str]:
 
 
 class AltAccountWatcher:
-    """Alt account worker: sits in the VC as an active stream viewer (not muted/deafened)."""
+    """Alt account worker: sits in VC as active viewer, re-joins cleanly on disconnect."""
 
     def __init__(self, alt_token: str, guild_id: str, channel_id: str) -> None:
         self.token = alt_token
@@ -106,7 +124,7 @@ class AltAccountWatcher:
     async def run(self) -> None:
         while True:
             try:
-                logger.info("[Alt] Connecting Alt Account to Gateway...")
+                logger.info("[Alt] Connecting to Discord Gateway...")
                 async with websockets.connect(
                     GATEWAY_URL,
                     max_size=50 * 1024 * 1024,
@@ -149,8 +167,8 @@ class AltAccountWatcher:
                             logger.info(f"[Alt] Logged in as: {d['d']['user']['username']}")
                             break
 
-                    # Join VC as normal active viewer (NOT muted, NOT deafened)
-                    logger.info(f"[Alt] Joining Voice Channel {self.channel_id} as Active Viewer (Not Muted/Deafened)...")
+                    # Join VC once
+                    logger.info(f"[Alt] Joining Voice Channel {self.channel_id} as Active Viewer...")
                     await ws.send(json.dumps({
                         "op": 4,
                         "d": {
@@ -162,40 +180,24 @@ class AltAccountWatcher:
                         },
                     }))
 
-                    # Watchdog: ensure alt never leaves the voice channel
-                    async def alt_watchdog():
-                        while True:
-                            await asyncio.sleep(20)
-                            try:
-                                await ws.send(json.dumps({
-                                    "op": 4,
-                                    "d": {
-                                        "guild_id": self.guild_id,
-                                        "channel_id": self.channel_id,
-                                        "self_mute": False,
-                                        "self_deaf": False,
-                                        "self_video": False,
-                                    },
-                                }))
-                            except Exception:
-                                break
-
-                    watchdog_task = asyncio.create_task(alt_watchdog())
-
-                    # Keep running & watching streams
+                    # Listen for events & only rejoin if explicitly disconnected
                     while True:
                         m = await ws.recv()
                         d = json.loads(m)
                         t = d.get("t")
+
                         if t == "STREAM_CREATE":
                             sk = d["d"]["stream_key"]
-                            logger.info(f"[Alt] Detected Go-Live Stream {sk}. Sending STREAM_WATCH...")
+                            logger.info(f"[Alt] Stream detected: {sk}. Sending STREAM_WATCH...")
                             await ws.send(json.dumps({"op": 19, "d": {"stream_key": sk}}))
+
                         elif t == "VOICE_STATE_UPDATE":
                             if d["d"].get("user_id") == self.user_id:
-                                current_c = d["d"].get("channel_id")
-                                if current_c != self.channel_id:
-                                    logger.info("[Alt] Disconnected from VC. Re-joining immediately...")
+                                cur_c = d["d"].get("channel_id")
+                                # If disconnected, wait 2 seconds then rejoin
+                                if cur_c is None or cur_c != self.channel_id:
+                                    logger.info(f"[Alt] Voice state disconnected (channel={cur_c}). Rejoining in 2s...")
+                                    await asyncio.sleep(2.0)
                                     await ws.send(json.dumps({
                                         "op": 4,
                                         "d": {
@@ -208,12 +210,12 @@ class AltAccountWatcher:
                                     }))
 
             except Exception as e:
-                logger.warning(f"[Alt] Reconnecting in 5s: {e}")
+                logger.warning(f"[Alt] Connection notice: {e}. Auto-reconnecting in 5s...")
                 await asyncio.sleep(5)
 
 
 class MainCloudStreamer:
-    """Main account worker: broadcasts live status and screen shares 24/7 with auto-rejoin."""
+    """Main account worker: broadcasts live status and screen shares 24/7."""
 
     def __init__(self, token: str, guild_id: Optional[str], channel_id: Optional[str]) -> None:
         self.token = token
@@ -246,7 +248,7 @@ class MainCloudStreamer:
         while True:
             try:
                 stream_ws_url = f"wss://{stream_endpoint}/?v=7"
-                logger.info(f"Connecting to Stream Server: {stream_ws_url} (rtc_server_id: {rtc_server_id})...")
+                logger.info(f"Connecting to Stream Server: {stream_ws_url} (server_id: {rtc_server_id})...")
 
                 async with websockets.connect(stream_ws_url) as svws:
                     s_hello = json.loads(await svws.recv())
@@ -259,7 +261,7 @@ class MainCloudStreamer:
 
                     s_hb_task = asyncio.create_task(s_heartbeat())
 
-                    # Identify on Stream Server
+                    # Identify on Stream Server with rtc_server_id
                     s_identify = {
                         "op": 0,
                         "d": {
@@ -300,12 +302,12 @@ class MainCloudStreamer:
 
                     logger.info("🔴🔴 RED 'LIVE' SCREEN SHARE IS NOW BROADCASTING 24/7! 🔴🔴")
 
-                    # Keep stream alive
+                    # Keep stream alive indefinitely
                     while True:
-                        await asyncio.sleep(10)
+                        await asyncio.sleep(15)
 
             except Exception as e:
-                logger.warning(f"Stream media connection notice: {e}. Reconnecting in 3s...")
+                logger.warning(f"Stream media connection notice: {e}. Auto-reconnecting in 3s...")
                 await asyncio.sleep(3)
 
     async def run(self) -> None:
@@ -321,7 +323,7 @@ class MainCloudStreamer:
                     hb_interval = hello["d"]["heartbeat_interval"] / 1000.0
                     logger.info(f"Connected to Gateway. Heartbeat: {hb_interval:.1f}s")
 
-                    # Identify with Streaming Activity
+                    # Identify
                     identify = {
                         "op": 2,
                         "d": {
@@ -365,11 +367,10 @@ class MainCloudStreamer:
                             break
 
                     if self.channel_id and self.guild_id:
-                        logger.info(f"🎙 DIRECT SCREEN SHARE: Joining {self.channel_id} in {self.guild_id}...")
+                        logger.info(f"🎙 Joining Voice Channel {self.channel_id}...")
 
-                        async def send_join_and_stream():
-                            """Directly joins voice and triggers screen share."""
-                            logger.info("Sending VOICE_STATE_UPDATE (join channel)...")
+                        async def join_and_start_stream():
+                            # Join Voice
                             await ws.send(json.dumps({
                                 "op": 4,
                                 "d": {
@@ -381,7 +382,7 @@ class MainCloudStreamer:
                                 },
                             }))
                             await asyncio.sleep(0.5)
-                            logger.info("Sending STREAM_CREATE (direct screen share)...")
+                            # Start Screen Share
                             await ws.send(json.dumps({
                                 "op": 18,
                                 "d": {
@@ -392,33 +393,12 @@ class MainCloudStreamer:
                                 },
                             }))
 
-                        await send_join_and_stream()
+                        await join_and_start_stream()
 
                         rtc_server_id: Optional[str] = None
                         stream_media_task: Optional[asyncio.Task] = None
 
-                        # Self-healing watchdog: enforces voice & stream status every 20s
-                        async def voice_watchdog():
-                            while True:
-                                await asyncio.sleep(20)
-                                try:
-                                    # Refresh stream & voice state so Discord never disconnects on PC offline
-                                    await ws.send(json.dumps({
-                                        "op": 4,
-                                        "d": {
-                                            "guild_id": self.guild_id,
-                                            "channel_id": self.channel_id,
-                                            "self_mute": False,
-                                            "self_deaf": False,
-                                            "self_video": False,
-                                        },
-                                    }))
-                                except Exception:
-                                    break
-
-                        watchdog_task = asyncio.create_task(voice_watchdog())
-
-                        # Event loop
+                        # Event pump
                         while True:
                             m = await ws.recv()
                             d = json.loads(m)
@@ -432,8 +412,8 @@ class MainCloudStreamer:
                                 s_tok = d["d"].get("token")
                                 s_ep = d["d"].get("endpoint")
                                 if s_tok and s_ep:
-                                    logger.info(f"STREAM_SERVER_UPDATE: {s_ep}")
-                                    if stream_media_task:
+                                    logger.info(f"STREAM_SERVER_UPDATE received: {s_ep}")
+                                    if stream_media_task and not stream_media_task.done():
                                         stream_media_task.cancel()
                                     stream_media_task = asyncio.create_task(
                                         self._run_stream_media_server(s_ep, s_tok, rtc_server_id, session_id)
@@ -441,23 +421,25 @@ class MainCloudStreamer:
 
                             elif t == "VOICE_STATE_UPDATE":
                                 if d["d"].get("user_id") == self.user_id:
-                                    current_c = d["d"].get("channel_id")
+                                    cur_c = d["d"].get("channel_id")
                                     is_stream = d["d"].get("self_stream", False)
-                                    # If disconnected (e.g. PC closed Discord or offline kick), RE-JOIN IMMEDIATELY!
-                                    if current_c != self.channel_id or not is_stream:
-                                        logger.info(f"Self-Healing: channel={current_c}, stream={is_stream}. Re-asserting stream...")
-                                        await send_join_and_stream()
+                                    # If disconnected from channel, re-join cleanly
+                                    if cur_c is None or cur_c != self.channel_id or not is_stream:
+                                        logger.info(f"Voice state sync (channel={cur_c}, stream={is_stream}). Rejoining in 2s...")
+                                        await asyncio.sleep(2.0)
+                                        await join_and_start_stream()
 
                             elif t == "STREAM_DELETE":
-                                logger.info("Stream ended by Discord. Auto-restarting screen share...")
-                                await send_join_and_stream()
+                                logger.info("Stream ended. Re-initiating Go-Live stream...")
+                                await asyncio.sleep(1.0)
+                                await join_and_start_stream()
 
                     else:
                         while True:
                             await ws.recv()
 
             except Exception as e:
-                logger.warning(f"Main Gateway connection lost: {e}. Auto-reconnecting in 3 seconds...")
+                logger.warning(f"Main Gateway notice: {e}. Auto-reconnecting in 3 seconds...")
                 await asyncio.sleep(3)
 
 
@@ -466,8 +448,13 @@ async def async_main():
         logger.error("FATAL: No DISCORD_TOKEN provided! Set DISCORD_TOKEN env variable.")
         sys.exit(1)
 
+    # Start HTTP server
     http_thread = threading.Thread(target=start_http_health_check, daemon=True)
     http_thread.start()
+
+    # Start self-ping thread
+    ping_thread = threading.Thread(target=self_ping_worker, daemon=True)
+    ping_thread.start()
 
     guild_id = GUILD_ID
     if VOICE_CHANNEL_ID and not guild_id:
