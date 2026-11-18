@@ -92,7 +92,7 @@ Click **Save Changes / Deploy Web Service**!
 
 ---
 
-## ⏰ Keep Free Tier Running 24/7 (Prevent Render Sleeping)
+##  Keep Free Tier Running 24/7 (Prevent Render Sleeping)
 
 Render's free tier puts web services to sleep after 15 minutes of inactivity. To keep your stream running 24/7/365 uninterrupted:
 
@@ -118,6 +118,6 @@ Render's free tier puts web services to sleep after 15 minutes of inactivity. To
 
 ---
 
-## ⚠️ Disclaimer
+## ! Disclaimer
 
 This project is intended for educational purposes and personal presence automation. Use responsibly and in accordance with Discord's Terms of Service.
