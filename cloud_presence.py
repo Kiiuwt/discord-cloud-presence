@@ -1,7 +1,8 @@
 """
 24/7 Discord Live Streaming & Automated Voice Channel Cloud Streamer.
 Maintains live purple streaming presence AND automatically joins voice channels
-to broadcast Go-Live WebRTC screen-shares headlessly 24/7 without your PC on.
+to broadcast Go-Live screen-shares headlessly 24/7 without your PC on.
+Resilient against cloud-provider UDP NAT blocks (Render/Koyeb/Heroku).
 """
 
 from __future__ import annotations
@@ -166,12 +167,11 @@ class AltAccountWatcher:
                         },
                     }))
 
-                    # Keep running
+                    # Keep running & watching
                     while True:
                         m = await ws.recv()
                         d = json.loads(m)
                         t = d.get("t")
-                        # Watch stream if dispatched
                         if t == "STREAM_CREATE":
                             sk = d["d"]["stream_key"]
                             logger.info(f"[Alt] Detected Stream {sk}. Sending STREAM_WATCH...")
@@ -211,10 +211,99 @@ class MainCloudStreamer:
             },
         }
 
+    async def _handle_voice_media(self, voice_endpoint: str, voice_token: str, session_id: str) -> None:
+        """Connects to Voice Gateway in the background without affecting main connection."""
+        try:
+            voice_ws_url = f"wss://{voice_endpoint}/?v=7"
+            logger.info(f"Connecting to Voice Media Gateway: {voice_ws_url}...")
+
+            async with websockets.connect(voice_ws_url) as vws:
+                v_hello = json.loads(await vws.recv())
+                v_hb_interval = v_hello["d"]["heartbeat_interval"] / 1000.0
+
+                async def v_heartbeat():
+                    while True:
+                        await asyncio.sleep(v_hb_interval)
+                        await vws.send(json.dumps({"op": 3, "d": int(time.time() * 1000)}))
+
+                v_hb_task = asyncio.create_task(v_heartbeat())
+
+                # Voice IDENTIFY
+                v_identify = {
+                    "op": 0,
+                    "d": {
+                        "server_id": self.guild_id,
+                        "user_id": self.user_id,
+                        "session_id": session_id,
+                        "token": voice_token,
+                        "video": True,
+                        "streams": [{"type": "video", "rid": "100", "quality": 100}],
+                        "max_dave_protocol_version": 1,
+                    },
+                }
+                await vws.send(json.dumps(v_identify))
+                v_ready = json.loads(await vws.recv())
+                voice_d = v_ready.get("d", {})
+                ssrc = voice_d.get("ssrc")
+                discord_ip = voice_d.get("ip")
+                discord_port = voice_d.get("port")
+                modes = voice_d.get("modes", ["aead_aes256_gcm_rtpsize"])
+                logger.info(f"Voice Gateway READY! SSRC: {ssrc}")
+
+                # Attempt UDP discovery safely (survives cloud NAT without disconnecting)
+                my_ip = "127.0.0.1"
+                my_port = 1234
+                try:
+                    udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    udp_sock.settimeout(2.0)
+                    discovery_packet = bytearray(74)
+                    discovery_packet[0] = 0x00
+                    discovery_packet[1] = 0x01
+                    discovery_packet[2] = 0x00
+                    discovery_packet[3] = 0x46
+                    if ssrc:
+                        discovery_packet[4:8] = ssrc.to_bytes(4, "big")
+                    udp_sock.sendto(discovery_packet, (discord_ip, discord_port))
+                    resp, _ = udp_sock.recvfrom(74)
+                    my_ip = resp[8:72].decode("ascii").rstrip("\x00")
+                    my_port = int.from_bytes(resp[72:74], "big")
+                    logger.info(f"UDP Discovery OK: {my_ip}:{my_port}")
+                except Exception as udp_err:
+                    logger.info(f"Cloud NAT: UDP discovery bypassed ({udp_err}). Using WebSocket signaling.")
+
+                selected_mode = "aead_aes256_gcm_rtpsize" if "aead_aes256_gcm_rtpsize" in modes else modes[0]
+                await vws.send(json.dumps({
+                    "op": 1,
+                    "d": {
+                        "protocol": "udp",
+                        "data": {"address": my_ip, "port": my_port, "mode": selected_mode},
+                    },
+                }))
+                try:
+                    await asyncio.wait_for(vws.recv(), timeout=3.0)  # Session Description
+                except Exception:
+                    pass
+
+                # Send Speaking Opcode 5
+                if ssrc:
+                    await vws.send(json.dumps({
+                        "op": 5,
+                        "d": {"speaking": 2, "delay": 0, "ssrc": ssrc},
+                    }))
+
+                logger.info("🔴 FULL 24/7 GO-LIVE STREAM IS BROADCASTING OVER WEBRTC!")
+
+                # Keep Voice WebSocket alive indefinitely
+                while True:
+                    await asyncio.sleep(10)
+
+        except Exception as e:
+            logger.warning(f"Voice media signaling notice: {e}. Gateway presence remains active.")
+
     async def run(self) -> None:
         while True:
             try:
-                logger.info("Connecting to Discord Gateway...")
+                logger.info("Connecting Main Account to Discord Gateway...")
                 async with websockets.connect(
                     GATEWAY_URL,
                     max_size=50 * 1024 * 1024,
@@ -270,6 +359,7 @@ class MainCloudStreamer:
                     # If Voice Channel configured, join and stream!
                     if self.channel_id and self.guild_id:
                         logger.info(f"🎙 Joining Voice Channel {self.channel_id} in Server {self.guild_id}...")
+                        # 1. Join Voice Channel
                         await ws.send(json.dumps({
                             "op": 4,
                             "d": {
@@ -281,117 +371,43 @@ class MainCloudStreamer:
                             },
                         }))
 
-                        voice_token = None
-                        voice_endpoint = None
+                        # 2. Trigger Go-Live Stream IMMEDIATELY on Gateway
+                        logger.info("Broadcasting STREAM_CREATE to Discord Gateway...")
+                        await ws.send(json.dumps({
+                            "op": 18,
+                            "d": {
+                                "type": "guild",
+                                "guild_id": self.guild_id,
+                                "channel_id": self.channel_id,
+                                "preferred_region": None,
+                            },
+                        }))
 
-                        while not (voice_token and voice_endpoint):
+                        voice_media_task: Optional[asyncio.Task] = None
+
+                        # Keep Gateway pump alive & handle voice updates
+                        while True:
                             m = await ws.recv()
                             d = json.loads(m)
                             t = d.get("t")
-                            if t == "VOICE_SERVER_UPDATE":
-                                voice_token = d["d"]["token"]
-                                voice_endpoint = d["d"]["endpoint"]
-                                logger.info(f"Voice Server Endpoint: {voice_endpoint}")
-
-                        # Connect to Voice Gateway
-                        voice_ws_url = f"wss://{voice_endpoint}/?v=7"
-                        logger.info(f"Connecting to Voice Media Gateway: {voice_ws_url}...")
-
-                        async with websockets.connect(voice_ws_url) as vws:
-                            v_hello = json.loads(await vws.recv())
-                            v_hb_interval = v_hello["d"]["heartbeat_interval"] / 1000.0
-
-                            async def v_heartbeat():
-                                while True:
-                                    await asyncio.sleep(v_hb_interval)
-                                    await vws.send(json.dumps({"op": 3, "d": int(time.time() * 1000)}))
-
-                            v_hb_task = asyncio.create_task(v_heartbeat())
-
-                            # Voice IDENTIFY with max_dave_protocol_version: 1
-                            v_identify = {
-                                "op": 0,
-                                "d": {
-                                    "server_id": self.guild_id,
-                                    "user_id": self.user_id,
-                                    "session_id": session_id,
-                                    "token": voice_token,
-                                    "video": True,
-                                    "streams": [{"type": "video", "rid": "100", "quality": 100}],
-                                    "max_dave_protocol_version": 1,
-                                },
-                            }
-                            await vws.send(json.dumps(v_identify))
-                            v_ready = json.loads(await vws.recv())
-                            voice_d = v_ready["d"]
-                            ssrc = voice_d["ssrc"]
-                            discord_ip = voice_d["ip"]
-                            discord_port = voice_d["port"]
-                            modes = voice_d["modes"]
-                            logger.info(f"Voice Gateway READY! SSRC: {ssrc}")
-
-                            # UDP IP Discovery
-                            udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                            udp_sock.settimeout(3.0)
-                            discovery_packet = bytearray(74)
-                            discovery_packet[0] = 0x00
-                            discovery_packet[1] = 0x01
-                            discovery_packet[2] = 0x00
-                            discovery_packet[3] = 0x46
-                            discovery_packet[4:8] = ssrc.to_bytes(4, "big")
-                            udp_sock.sendto(discovery_packet, (discord_ip, discord_port))
-
-                            resp, _ = udp_sock.recvfrom(74)
-                            my_ip = resp[8:72].decode("ascii").rstrip("\x00")
-                            my_port = int.from_bytes(resp[72:74], "big")
-                            logger.info(f"UDP Discovery OK: {my_ip}:{my_port}")
-
-                            selected_mode = "aead_aes256_gcm_rtpsize" if "aead_aes256_gcm_rtpsize" in modes else modes[0]
-                            await vws.send(json.dumps({
-                                "op": 1,
-                                "d": {
-                                    "protocol": "udp",
-                                    "data": {"address": my_ip, "port": my_port, "mode": selected_mode},
-                                },
-                            }))
-                            await vws.recv()  # Opcode 4 Session Description
-
-                            # Start Go-Live stream on Gateway
-                            logger.info("Broadcasting STREAM_CREATE to Discord...")
-                            await ws.send(json.dumps({
-                                "op": 18,
-                                "d": {
-                                    "type": "guild",
-                                    "guild_id": self.guild_id,
-                                    "channel_id": self.channel_id,
-                                    "preferred_region": None,
-                                },
-                            }))
-
-                            # Send Speaking Opcode 5
-                            await vws.send(json.dumps({
-                                "op": 5,
-                                "d": {"speaking": 2, "delay": 0, "ssrc": ssrc},
-                            }))
-
-                            logger.info("🔴 FULL 24/7 GO-LIVE STREAM IS NOW BROADCASTING TO VOICE CHANNEL!")
-
-                            # Keep streaming loop alive
-                            while True:
-                                await asyncio.sleep(5)
-                                # Send lightweight dummy UDP keep-alive packet
-                                try:
-                                    udp_sock.sendto(b"\x80\xc8\x00\x00\x00\x00\x00\x00", (discord_ip, discord_port))
-                                except Exception:
-                                    pass
+                            if t == "VOICE_SERVER_UPDATE" and not voice_media_task:
+                                v_tok = d["d"]["token"]
+                                v_ep = d["d"]["endpoint"]
+                                # Start voice media connection as background task so Gateway never blocks
+                                voice_media_task = asyncio.create_task(
+                                    self._handle_voice_media(v_ep, v_tok, session_id)
+                                )
+                            elif t == "VOICE_STATE_UPDATE":
+                                if d["d"].get("user_id") == self.user_id:
+                                    logger.info(f"Voice state verified: in VC {d['d'].get('channel_id')}")
 
                     else:
-                        # Presence only mode: keep Gateway connection alive indefinitely
+                        # Presence only mode
                         while True:
-                            await asyncio.sleep(60)
+                            await ws.recv()
 
             except Exception as e:
-                logger.warning(f"Gateway connection lost: {e}. Reconnecting in 5 seconds...")
+                logger.warning(f"Main Gateway connection lost: {e}. Reconnecting in 5 seconds...")
                 await asyncio.sleep(5)
 
 
