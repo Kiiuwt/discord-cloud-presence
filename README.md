@@ -9,14 +9,14 @@ A lightweight, high-performance cloud runner that keeps your Discord account bro
 
 ---
 
-## ✨ Features
+##  Features
 
 - ☁️ **100% PC-Free (Cloud Powered)**: Runs entirely on free cloud hosts (Render, Koyeb, Railway, VPS, or Docker). Turn your PC off, disconnect Wi-Fi, or go to sleep—your stream stays live.
 - 📺 **Profile Streaming Badge**: Broadcasts real-time purple streaming presence with customizable games (Minecraft, Valorant, etc.) and Twitch/YouTube links across all mutual servers and friend lists.
 - 🎙️ **Automated Voice Go-Live**: Headlessly joins your voice channel and broadcasts a WebRTC video stream (`self_stream: True`).
 - 👥 **Dual-Account Auto-Viewer**: Automatically connects a second/alt account into the same voice channel to watch your stream so Discord's server rolls up every single elapsed hour toward your badge.
-- 🔒 **DAVE E2EE Compatible**: Fully compatible with Discord's latest voice encryption protocol (DAVE MLS E2EE) and UDP discovery.
-- ⚡ **Built-In Keep-Alive Server**: Integrated HTTP server on port `8080` that responds to free uptime monitors (UptimeRobot, Cron-Job) so your container never sleeps.
+-  **DAVE E2EE Compatible**: Fully compatible with Discord's latest voice encryption protocol (DAVE MLS E2EE) and UDP discovery.
+-  **Built-In Keep-Alive Server**: Integrated HTTP server on port `8080` that responds to free uptime monitors (UptimeRobot, Cron-Job) so your container never sleeps.
 
 ---
 
